@@ -146,6 +146,13 @@ class WebRTCClient(private val context: Context, private val onConnectionStateCh
 
         lastFrameSentAt = now
 
+        val queueSize = webSocket?.queueSize() ?: 0L
+        // 200KB limit (approx 6-8 frames)
+        if (queueSize > 200_000L) {
+            Log.w("WebRTCClient", "Dropping frame to avoid lag (queue: $queueSize)")
+            return
+        }
+
         val byteString = ByteString.of(*jpegBytes)
         val success = webSocket?.send(byteString) ?: false
         if (!success) {

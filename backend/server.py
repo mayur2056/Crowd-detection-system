@@ -251,18 +251,18 @@ async def websocket_camera(websocket: WebSocket, code: str):
                     continue  # Skip sending on error, wait for next frame
 
                 # FIX: Send ONLY when a new frame was just processed
-                # Old code sent stale frames in a tight loop even with no new data
                 if last_sent_jpeg is not None:
-                    dead = []
-                    for dash_ws in session.dashboard_connections:
+                    async def send_to_dash(ws, payload, jpeg):
                         try:
-                            if last_sent_payload is not None:
-                                await dash_ws.send_text(last_sent_payload)
-                            await dash_ws.send_bytes(last_sent_jpeg)
+                            if payload is not None:
+                                await ws.send_text(payload)
+                            await ws.send_bytes(jpeg)
                         except Exception:
-                            dead.append(dash_ws)
-                    for d in dead:
-                        session.dashboard_connections.remove(d)
+                            if ws in session.dashboard_connections:
+                                session.dashboard_connections.remove(ws)
+                                
+                    for dash_ws in session.dashboard_connections.copy():
+                        asyncio.create_task(send_to_dash(dash_ws, last_sent_payload, last_sent_jpeg))
 
         except asyncio.CancelledError:
             pass

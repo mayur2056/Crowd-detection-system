@@ -83,6 +83,11 @@ function connectToDashboard(host, code) {
     statusText.textContent = 'Connecting...';
     statusDot.className = 'w-3 h-3 rounded-full bg-amber-400 animate-pulse';
 
+    if (ws) {
+        ws.close();
+        ws = null;
+    }
+
     ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
 
@@ -148,20 +153,25 @@ function connectToDashboard(host, code) {
  *      out-of-order frames from appearing (fast network bursts can deliver
  *      two frames before the first onload fires).
  */
+// Use a counter to prevent painting older frames if they arrive out-of-order
+let currentFrameId = 0;
+
 function renderFrame(arrayBuffer) {
     const blob = new Blob([arrayBuffer], { type: "image/jpeg" });
     const newUrl = URL.createObjectURL(blob);
-
-    // Cancel previous pending preload to avoid stale out-of-order swap
-    if (pendingImage) {
-        pendingImage.onload = null;
-        pendingImage.onerror = null;
-        pendingImage = null;
-    }
+    
+    currentFrameId++;
+    const thisFrameId = currentFrameId;
 
     const img = new Image();
 
     img.onload = () => {
+        // If a newer frame started loading while we were decoding, discard this one
+        if (thisFrameId !== currentFrameId) {
+            URL.revokeObjectURL(newUrl);
+            return;
+        }
+
         // Revoke the OLD blob URL now that the new frame is ready
         if (window.previousImageUrl) {
             URL.revokeObjectURL(window.previousImageUrl);
@@ -170,7 +180,6 @@ function renderFrame(arrayBuffer) {
         // Atomic swap — browser paints new frame with zero blank gap
         videoStream.src = newUrl;
         window.previousImageUrl = newUrl;
-        pendingImage = null;
 
         // Show stream, hide placeholders
         videoStream.classList.remove('hidden');
@@ -182,12 +191,9 @@ function renderFrame(arrayBuffer) {
     };
 
     img.onerror = () => {
-        // Blob was revoked or corrupt — free memory and move on
         URL.revokeObjectURL(newUrl);
-        pendingImage = null;
     };
 
-    pendingImage = img;
     img.src = newUrl;
 }
 
