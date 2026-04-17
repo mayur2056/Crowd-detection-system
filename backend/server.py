@@ -111,7 +111,36 @@ async def generate_speech(req: SpeechRequest):
         )
         return {"speech": msg}
         
-    prompt = f"You are an AI Security system. The current crowd count is {req.count} and the alert level is {req.status}. Provide a brief, authoritative but human-like voice announcement giving instructions to the crowd. Maximum 2 sentences. Keep it natural."
+    prompt = f"""You are a professional crowd control officer monitoring a live CCTV system.
+
+Based on the data:
+- People count: {req.count}
+- Crowd density level: {req.status} (GREEN = LOW, BLUE = MEDIUM, RED = HIGH)
+
+Generate a short alert message (1-2 sentences).
+
+Your message MUST include:
+1. Current crowd situation
+2. Risk level
+3. Clear and practical instructions to reduce crowd
+
+Guidelines:
+- Speak like a real human security officer
+- Be calm, clear, and authoritative
+- Give actionable instructions (not generic advice)
+- Focus on reducing congestion
+
+Examples of actions:
+- Ask people to move to less crowded areas
+- Suggest maintaining distance
+- Control entry or exit flow
+- Guide movement direction
+for example, "Please move towards the exit gates and avoid standing in the central area"
+
+Do NOT:
+- Be robotic
+- Be too long 
+"""
     
     try:
         async with httpx.AsyncClient() as client:
