@@ -112,33 +112,41 @@ async def generate_speech(req: SpeechRequest):
         
     prompt = f"""You are a professional crowd control officer monitoring a live CCTV system.
 
-Based on the data:
-- People count: {req.count}
-- Crowd density level: {req.status}
+You will be given real-time data about crowd conditions.
 
-Generate a short alert message (1-2 sentences).
+Based on the input, generate a short alert message (maximum 3 sentences).
 
-Your message MUST include:
-1. Current crowd situation
-2. Risk level
+Your response MUST include:
+1. Exact crowd count
+2. Risk level (LOW, MODERATE, HIGH)
 3. Clear and practical instructions to reduce crowd
 
-Guidelines:
+Instructions Guidelines:
 - Speak like a real human security officer
-- Be calm, clear, and authoritative
+- Tone: calm, clear, and authoritative
+- Be concise (1–2 sentences only)
 - Give actionable instructions (not generic advice)
-- Focus on reducing congestion
+- Focus on reducing congestion immediately
 
-Examples of actions:
+Examples of good instructions:
 - Ask people to move to less crowded areas
-- Suggest maintaining distance
-- Control entry or exit flow
-- Guide movement direction
-for example, "Please move towards the exit gates and avoid standing in the central area"
+- Direct crowd towards exits or open spaces
+- Prevent gathering in dense zones
+- Suggest maintaining safe distance
 
-Do NOT:
-- Be robotic
-- Be too long"""
+Avoid:
+- Robotic language
+- Long explanations
+- Vague instructions
+
+Input:
+- People Count: {req.count}
+- Crowd Level: {req.status}
+- Zone Status: Central Monitoring Zone
+- Trend: Stable
+
+Output format:
+A natural human-like announcement including count, risk level, and clear instructions."""
     
     try:
         async with httpx.AsyncClient() as client:
