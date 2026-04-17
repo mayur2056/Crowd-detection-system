@@ -109,13 +109,12 @@ async def generate_speech(req: SpeechRequest):
             f"Count is moderate, there are {req.count} people, showing blue color." if req.status == "BLUE" else 
             f"Count is less, only {req.count}, that's why you are seeing green color in the frame."
         )
-        return {"speech": msg}
         
     prompt = f"""You are a professional crowd control officer monitoring a live CCTV system.
 
 Based on the data:
 - People count: {req.count}
-- Crowd density level: {req.status} (GREEN = LOW, BLUE = MEDIUM, RED = HIGH)
+- Crowd density level: {req.status}
 
 Generate a short alert message (1-2 sentences).
 
@@ -139,8 +138,7 @@ for example, "Please move towards the exit gates and avoid standing in the centr
 
 Do NOT:
 - Be robotic
-- Be too long 
-"""
+- Be too long"""
     
     try:
         async with httpx.AsyncClient() as client:
