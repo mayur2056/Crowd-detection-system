@@ -97,6 +97,40 @@ class SessionResponse(BaseModel):
     code: str
     expires_in_hours: int = 24
 
+class SpeechRequest(BaseModel):
+    count: int
+    status: str
+
+@app.post("/api/generate_speech")
+async def generate_speech(req: SpeechRequest):
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        msg = "Attention, too much crowd." if req.status == "RED" else (
+            f"Count is moderate, there are {req.count} people, showing blue color." if req.status == "BLUE" else 
+            f"Count is less, only {req.count}, that's why you are seeing green color in the frame."
+        )
+        return {"speech": msg}
+        
+    prompt = f"You are an AI Security system. The current crowd count is {req.count} and the alert level is {req.status}. Provide a brief, authoritative but human-like voice announcement giving instructions to the crowd. Maximum 2 sentences. Keep it natural."
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [{"role": "user", "content": prompt}]
+                },
+                timeout=10.0
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {"speech": data["choices"][0]["message"]["content"].strip()}
+    except Exception as e:
+        logger.error(f"Groq API error: {e}")
+        return {"speech": f"Attention, crowd count is {req.count}."}
+
 
 @app.post("/session/create", response_model=SessionResponse)
 async def create_session():
@@ -152,6 +186,7 @@ async def process_inference_route(request: Request):
     data = await request.body()
     result = await asyncio.to_thread(process_frame, data)
     result["jpeg_bytes"] = base64.b64encode(result["jpeg_bytes"]).decode("utf-8")
+    result["heatmap_bytes"] = base64.b64encode(result["heatmap_bytes"]).decode("utf-8")
     return result
 
 
@@ -179,25 +214,47 @@ def process_frame(frame_bytes: bytes) -> Dict:
     count = 0
     annotated_img = small_img.copy()
 
+    # Create mask for heatmap
+    hm_mask = np.zeros((INFERENCE_SIZE, INFERENCE_SIZE), dtype=np.float32)
+
     if len(results) > 0:
         result = results[0]
         count = len(result.boxes)
         annotated_img = result.plot()
+        
+        # Add blur intensity for each detected person
+        for box in result.boxes:
+            b = box.xyxy[0]
+            cx = int((b[0] + b[2]) / 2)
+            cy = int((b[1] + b[3]) / 2)
+            cv2.circle(hm_mask, (cx, cy), 35, (1.0), -1)
 
-    if count <= 5:
+    # Blur mask to spread the heat distribution
+    hm_mask = cv2.GaussianBlur(hm_mask, (75, 75), 0)
+    max_val = np.max(hm_mask)
+    if max_val > 0:
+        hm_mask = hm_mask / max_val
+        
+    hm_mask = np.uint8(255 * hm_mask)
+    heatmap_colored = cv2.applyColorMap(hm_mask, cv2.COLORMAP_JET)
+    heatmap_overlay = cv2.addWeighted(small_img, 0.3, heatmap_colored, 0.7, 0)
+
+    if count < 5:
         status = "GREEN"
-    elif count <= 15:
-        status = "YELLOW"
+    elif count < 12:
+        status = "BLUE"
     else:
         status = "RED"
 
     # Output at 50% quality — smaller payload = faster dashboard delivery
     _, encoded_img = cv2.imencode(".jpg", annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+    _, encoded_hm = cv2.imencode(".jpg", heatmap_overlay, [cv2.IMWRITE_JPEG_QUALITY, 50])
 
     return {
         "status": status,
         "count": count,
         "jpeg_bytes": encoded_img.tobytes(),
+        "heatmap_bytes": encoded_hm.tobytes(),
         "timestamp": time.time()
     }
 
@@ -257,6 +314,7 @@ async def websocket_camera(websocket: WebSocket, code: str):
         active_sends = set()
         last_sent_payload = None
         last_sent_jpeg = None
+        last_sent_hm = None
         
         try:
             while processing_state["running"]:
@@ -284,6 +342,7 @@ async def websocket_camera(websocket: WebSocket, code: str):
                             resp.raise_for_status()
                             result = resp.json()
                             result["jpeg_bytes"] = base64.b64decode(result["jpeg_bytes"])
+                            result["heatmap_bytes"] = base64.b64decode(result["heatmap_bytes"])
                     else:
                         # Offload CPU-heavy YOLO inference to a thread pool
                         # so the async event loop isn't blocked during inference
@@ -293,7 +352,9 @@ async def websocket_camera(websocket: WebSocket, code: str):
                     logger.info(f"[{code}] [PROCESS] YOLO Inference proxy loop completed in {inf_time_ms}ms. Found {result['count']} people.")
 
                     last_sent_jpeg = result["jpeg_bytes"]
+                    last_sent_hm = result["heatmap_bytes"]
                     del result["jpeg_bytes"]
+                    del result["heatmap_bytes"]
                     last_sent_payload = json.dumps(result)
 
                 except Exception as e:
@@ -302,11 +363,13 @@ async def websocket_camera(websocket: WebSocket, code: str):
 
                 # FIX: Send ONLY when a new frame was just processed
                 if last_sent_jpeg is not None:
-                    async def send_to_dash(ws, payload, jpeg):
+                    async def send_to_dash(ws, payload, jpeg, heatmap):
                         try:
                             if payload is not None:
                                 await ws.send_text(payload)
-                            await ws.send_bytes(jpeg)
+                            await ws.send_bytes(b'\x00' + jpeg)
+                            if heatmap is not None:
+                                await ws.send_bytes(b'\x01' + heatmap)
                         except Exception:
                             if ws in session.dashboard_connections:
                                 session.dashboard_connections.remove(ws)
@@ -322,7 +385,7 @@ async def websocket_camera(websocket: WebSocket, code: str):
                             
                         active_sends.add(dash_ws)
                         logger.info(f"[{code}] [NETWORK] 🚀 Dispatching new frame block to dashboard...")
-                        asyncio.create_task(send_to_dash(dash_ws, last_sent_payload, last_sent_jpeg))
+                        asyncio.create_task(send_to_dash(dash_ws, last_sent_payload, last_sent_jpeg, last_sent_hm))
 
         except asyncio.CancelledError:
             pass

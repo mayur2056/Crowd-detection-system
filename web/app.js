@@ -24,10 +24,12 @@ const currentSessionCode = document.getElementById('currentSessionCode');
 let ws;
 let lastFrameTime = Date.now();
 let checkConnectionInterval;
-let redStateStartTime = 0;
-let isAlertActive = false;
 let activeSessionCode = null;     // current 6-char code
 let activeServerHost = null;     // current host (no protocol)
+
+let currentStableStatus = null;
+let stableStateStartTime = Date.now();
+let hasSpokenForState = false;
 
 // FIX: Track the pending preload image so we can cancel it if a newer
 // frame arrives before the previous one finishes loading. Without this,
@@ -128,72 +130,44 @@ function connectToDashboard(host, code) {
     ws.onmessage = (event) => {
         if (typeof event.data === "string") {
             const data = JSON.parse(event.data);
-            
             const serverToBrowserMs = Date.now() - (data.timestamp * 1000);
-            console.log(`%c[NETWORK] Received frame JSON metadata. Network Transit Delay: ~${Math.floor(serverToBrowserMs)}ms`, 'color: #3b82f6; font-weight: bold;');
-            
             updateDashboard(data);
         } else if (event.data instanceof ArrayBuffer) {
-            console.log(`%c[RENDER] ArrayBuffer frame arrived (${event.data.byteLength} bytes). Decoding...`, 'color: #8b5cf6;');
-            renderFrame(event.data);
+            const view = new Uint8Array(event.data);
+            const type = view[0];
+            const payload = event.data.slice(1);
+
+            if (type === 0) {
+                renderFrame(payload, videoStream, 'previousImageUrl', document.getElementById('noSignal'));
+            } else if (type === 1) {
+                renderFrame(payload, document.getElementById('heatmapStream'), 'previousHeatmapUrl', document.getElementById('noSignalHm'));
+            }
         }
     };
 }
 
 // ── Frame rendering ───────────────────────────────────────────────────────────
-/**
- * FIX: Replaced direct img.src swap with an off-screen preload + atomic swap.
- *
- * OLD behaviour:
- *   videoStream.src = newBlobUrl
- *   → The <img> tag briefly goes blank while the browser decodes the new JPEG.
- *   → At 10-12 FPS this blank gap is visible as constant flickering / strobing.
- *
- * NEW behaviour:
- *   1. Create an off-screen Image() and set its src to the new blob URL.
- *   2. Only swap videoStream.src AFTER the new image is fully decoded (onload).
- *   3. Revoke the OLD blob URL only after the swap — never before — so there
- *      is no moment where the visible <img> has no valid src.
- *   4. Cancel any in-flight preload if a newer frame arrives first, preventing
- *      out-of-order frames from appearing (fast network bursts can deliver
- *      two frames before the first onload fires).
- */
-// Use a counter to prevent painting older frames if they arrive out-of-order
 let currentFrameId = 0;
 
-function renderFrame(arrayBuffer) {
+function renderFrame(arrayBuffer, targetImgEl, keyName, fallbackEl) {
     const blob = new Blob([arrayBuffer], { type: "image/jpeg" });
     const newUrl = URL.createObjectURL(blob);
     
     currentFrameId++;
     const thisFrameId = currentFrameId;
-    const decodeStart = Date.now();
 
     const img = new Image();
 
     img.onload = () => {
-        const decodeTime = Date.now() - decodeStart;
-        // If a newer frame started loading while we were decoding, discard this one
-        if (thisFrameId !== currentFrameId) {
-            console.log(`[RENDER] 🚨 Dropped older frame #${thisFrameId} (Superseded by #${currentFrameId}) after ${decodeTime}ms decode.`);
-            URL.revokeObjectURL(newUrl);
-            return;
+        if (window[keyName]) {
+            URL.revokeObjectURL(window[keyName]);
         }
 
-        console.log(`%c[RENDER] ✅ Painted frame #${thisFrameId} successfully in ${decodeTime}ms.`, 'color: #10b981;');
+        targetImgEl.src = newUrl;
+        window[keyName] = newUrl;
 
-        // Revoke the OLD blob URL now that the new frame is ready
-        if (window.previousImageUrl) {
-            URL.revokeObjectURL(window.previousImageUrl);
-        }
-
-        // Atomic swap — browser paints new frame with zero blank gap
-        videoStream.src = newUrl;
-        window.previousImageUrl = newUrl;
-
-        // Show stream, hide placeholders
-        videoStream.classList.remove('hidden');
-        noSignal.classList.add('hidden');
+        targetImgEl.classList.remove('hidden');
+        if (fallbackEl) fallbackEl.classList.add('hidden');
         reconnectingOverlay.classList.replace('opacity-100', 'opacity-0');
         reconnectingOverlay.classList.add('pointer-events-none');
 
@@ -207,6 +181,7 @@ function renderFrame(arrayBuffer) {
     img.src = newUrl;
 }
 
+
 // ── Dashboard update ─────────────────────────────────────────────────────────
 function updateDashboard(data) {
     peopleCount.textContent = data.count;
@@ -216,13 +191,20 @@ function updateDashboard(data) {
 
     applyStatusColor(data.status);
 
-    if (data.status === "RED") {
-        if (redStateStartTime === 0) redStateStartTime = Date.now();
-        const duration = (Date.now() - redStateStartTime) / 1000;
-        if (duration > 10 && !isAlertActive) triggerAlert();
+    if (data.status !== currentStableStatus) {
+        currentStableStatus = data.status;
+        stableStateStartTime = Date.now();
+        hasSpokenForState = false;
     } else {
-        redStateStartTime = 0;
-        if (isAlertActive) clearAlert();
+        const duration = (Date.now() - stableStateStartTime) / 1000;
+        if (duration > 3.0 && !hasSpokenForState) {
+            hasSpokenForState = true;
+            triggerSpeechAlert(data.count, data.status);
+            
+            // Visual alert box trigger
+            if (data.status === "RED") triggerAlert();
+            else clearAlert();
+        }
     }
 }
 
@@ -235,14 +217,36 @@ function applyStatusColor(status) {
         statusIndicator.className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
         statusBadge.classList.add('bg-emerald-100', 'text-emerald-700');
         densityCard.classList.add('border-emerald-200');
-    } else if (status === "YELLOW") {
-        statusIndicator.className = "w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse";
-        statusBadge.classList.add('bg-amber-100', 'text-amber-700');
-        densityCard.classList.add('border-amber-200');
+    } else if (status === "BLUE") {
+        statusIndicator.className = "w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse";
+        statusBadge.classList.add('bg-blue-100', 'text-blue-700');
+        densityCard.classList.add('border-blue-200');
     } else if (status === "RED") {
         statusIndicator.className = "w-2.5 h-2.5 rounded-full bg-red-600 animate-ping";
         statusBadge.classList.add('bg-red-100', 'text-red-700');
         densityCard.classList.add('border-red-300', 'shadow-lg', 'shadow-red-500/20');
+    }
+}
+
+async function triggerSpeechAlert(count, status) {
+    try {
+        const hostUrl = getHttpBase(activeServerHost);
+        const res = await fetch(`${hostUrl}/api/generate_speech`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({count, status})
+        });
+        const data = await res.json();
+        
+        const utterance = new SpeechSynthesisUtterance(data.speech);
+        // Try to pick a natural Microsoft voice if available
+        const voices = speechSynthesis.getVoices();
+        const msVoice = voices.find(v => v.name.includes("Microsoft") && v.name.includes("Natural"));
+        if (msVoice) utterance.voice = msVoice;
+        
+        speechSynthesis.speak(utterance);
+    } catch (e) {
+        console.error("Speech AI error:", e);
     }
 }
 
@@ -253,12 +257,8 @@ function triggerAlert() {
     alertIcon.innerHTML = `<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>`;
     alertTitle.textContent = "CRITICAL SERVER ALERT";
     alertTitle.classList.add('text-red-700');
-    alertMessage.textContent = "High density threshold exceeded for >10 seconds. Dispatching security.";
+    alertMessage.textContent = "High density threshold exceeded. Dispatching security.";
     alertMessage.classList.replace('text-slate-500', 'text-red-600');
-
-    try {
-        alertSound.play().catch(e => console.log("Sound blocked by browser policy"));
-    } catch (e) { }
 }
 
 function clearAlert() {
